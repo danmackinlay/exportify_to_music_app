@@ -5,6 +5,7 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 ## Quick Start
 
 ### Prerequisites
+
 - macOS with Music.app
 - `uv` installed (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
