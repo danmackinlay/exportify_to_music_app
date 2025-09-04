@@ -18,6 +18,7 @@ import argparse
 import sqlite3
 import time
 import concurrent.futures
+import hashlib
 import threading
 import itertools
 from pathlib import Path
@@ -42,7 +43,8 @@ ISRC_EXTS = {".m4a", ".mp4", ".mp3", ".flac"}  # formats we'll probe for ISRC
 def open_isrc_cache(path: Path):
     """Open SQLite cache for ISRC lookups."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    # allow cross-thread usage if it ever sneaks in, but we'll still write on the main thread
+    conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS isrc_cache (
             pid TEXT PRIMARY KEY,
@@ -193,6 +195,30 @@ def location_to_path(location_url):
     return None
 
 
+def canon_name(name: str) -> str:
+    """Canonicalize playlist name for stable ID generation."""
+    s = unidecode(name or "").lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def derive_playlist_ids(name: str, source_id: str | None = None, salt: str = "itxml:v1"):
+    """
+    Generate deterministic playlist IDs from canonical identity.
+    
+    Returns (playlist_id_int, playlist_persistent_id_hex16)
+    - source_id: if you have a Spotify playlist URI/ID, pass it; else None.
+    """
+    ident = source_id or canon_name(name)
+    payload = (salt + "\x1f" + ident).encode("utf-8")
+    h = hashlib.sha1(payload).digest()
+    pid_hex = h.hex().upper()[:16]                 # 16 hex chars
+    int_id  = int.from_bytes(h[:4], "big") & 0x7FFFFFFF
+    if int_id == 0:
+        int_id = 1
+    return int_id, pid_hex
+
+
 def extract_isrc_from_file(filepath):
     """Extract ISRC from audio file using mutagen."""
     if not filepath or not is_supported_audio(filepath):
@@ -263,6 +289,7 @@ def build_music_index(lib_xml, cache_conn=None):
     by_album = defaultdict(list)  # norm(album) -> [rec...] with disc/track numbers
     by_isrc = {}  # ISRC -> pid (exact match, from CACHE ONLY at build time)
     by_secs = defaultdict(list)  # int seconds -> [rec...]
+    by_tid = {}  # track_id -> rec for writing Tracks dict
 
     # Build index: (artist|title[|album]) -> list of {pid, track_id, secs}
     for tid, td in tracks.items():
@@ -308,6 +335,7 @@ def build_music_index(lib_xml, cache_conn=None):
         by_title[nt].append(rec)
         by_artist[na].append(rec)
         base_key_index[f"{na}|{nt}"].append(rec)
+        by_tid[int(tid)] = rec
 
         # Add to album index
         if nal:
@@ -332,26 +360,52 @@ def build_music_index(lib_xml, cache_conn=None):
         "base_key_index": base_key_index,
         "artists": set(by_artist.keys()),
         "titles": set(by_title.keys()),
+        "by_tid": by_tid,
     }
 
     return index, diag
 
 
 # ----- Playlist XML Writer -----
-def write_playlist_xml(playlist_name, track_ids, out_dir):
-    """Write minimal iTunes/Music XML containing just playlist entries."""
+def write_playlist_xml(playlist_name, track_ids, out_dir, by_tid):
+    """Write iTunes/Music XML with proper Tracks dictionary and playlist entries."""
+    # Build Tracks dict: keys must be strings of Track IDs
+    tracks_dict = {}
+    for tid in track_ids:
+        rec = by_tid.get(int(tid))
+        if not rec: 
+            continue
+        # Use the exact Location string from the library export (already file:// URL)
+        track_entry = {
+            "Track ID": int(tid),
+            "Name": rec.get("title") or "",
+            "Artist": rec.get("artist") or "",
+            "Album": rec.get("album") or "",
+            "Track Type": "File",
+        }
+        if rec.get("secs") is not None:
+            track_entry["Total Time"] = int(rec["secs"]) * 1000
+        if rec.get("pid"):
+            track_entry["Persistent ID"] = rec["pid"]
+        if rec.get("location"):
+            track_entry["Location"] = rec["location"]  # DO NOT unquote; keep as exported
+        tracks_dict[str(tid)] = track_entry
+
+    # Generate deterministic playlist IDs
+    plist_id, plist_pid = derive_playlist_ids(playlist_name)
+
     plist = {
         "Major Version": 1,
         "Minor Version": 1,
         "Application Version": "13.0",
         "Features": 5,
         "Show Content Ratings": True,
-        "Tracks": {},  # empty; we rely on IDs already in library
+        "Tracks": tracks_dict,
         "Playlists": [
             {
                 "Name": playlist_name,
-                "Playlist ID": 1,
-                "Playlist Persistent ID": "0000000000000001",
+                "Playlist ID": plist_id,
+                "Playlist Persistent ID": plist_pid,
                 "All Items": True,
                 "Playlist Items": [{"Track ID": int(tid)} for tid in track_ids],
             }
@@ -714,7 +768,7 @@ def process_playlists(index, diag, args):
                         debug_emitted += 1
 
         if track_ids:
-            write_playlist_xml(pl_name, track_ids, args.output)
+            write_playlist_xml(pl_name, track_ids, args.output, diag["by_tid"])
             processed_count += 1
             total_tracks += len(track_ids)
             print(f"✓ {pl_name}: {len(track_ids)} tracks matched", end="")
@@ -794,6 +848,7 @@ def lazy_isrc_confirm(candidates, target_isrc_u, diag, args):
             break
 
     def probe(entry):
+        # worker: read tags only
         c, pid, p, mtime, size = entry
         isrc = None
         status = -1
@@ -802,26 +857,21 @@ def lazy_isrc_confirm(candidates, target_isrc_u, diag, args):
             status = 1 if isrc else 0
         except Exception:
             status = -1
-        # Update cache (both sqlite and in-memory)
-        cache_upsert(
-            diag["isrc_cache_conn"], pid, p, mtime or 0.0, size or 0, isrc, status
-        )
-        diag["isrc_cache_by_pid"][pid] = {
-            "path": p,
-            "mtime": mtime,
-            "size": size,
-            "isrc": isrc,
-            "status": status,
-            "updated": time.time(),
-        }
-        if status == 1 and isrc:
-            diag["by_isrc"][isrc.upper()] = pid
-        return (c, isrc)
+        return (c, pid, p, mtime, size, isrc, status)
 
     if to_probe:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            for c, isrc_found in ex.map(probe, to_probe):
+            for c, pid, p, mtime, size, isrc_found, status in ex.map(probe, to_probe):
+                # main thread: persist and update in-memory
+                cache_upsert(diag["isrc_cache_conn"], pid, p, mtime or 0.0, size or 0, isrc_found, status)
+                diag["isrc_cache_by_pid"][pid] = {
+                    "path": p, "mtime": mtime, "size": size,
+                    "isrc": isrc_found, "status": status, "updated": time.time(),
+                }
+                if status == 1 and isrc_found:
+                    diag["by_isrc"][isrc_found.upper()] = pid
                 if isrc_found and isrc_found.upper() == target_isrc_u:
+                    diag["isrc_cache_conn"].commit()
                     return c
         diag["isrc_cache_conn"].commit()
     return None
@@ -1029,6 +1079,7 @@ def main():
                 print(f"Prefetching ISRCs for {prefetch_n} CSV-album tracks...")
 
                 def _probe(e):
+                    # worker thread: read tags only, no DB writes
                     r, pid, p, mtime, size = e
                     isrc = None
                     status = -1
@@ -1037,25 +1088,20 @@ def main():
                         status = 1 if isrc else 0
                     except Exception:
                         status = -1
-                    cache_upsert(
-                        cache_conn, pid, p, mtime or 0.0, size or 0, isrc, status
-                    )
-                    diag["isrc_cache_by_pid"][pid] = {
-                        "path": p,
-                        "mtime": mtime,
-                        "size": size,
-                        "isrc": isrc,
-                        "status": status,
-                        "updated": time.time(),
-                    }
-                    if status == 1 and isrc:
-                        diag["by_isrc"][isrc.upper()] = pid
+                    return (pid, p, mtime, size, isrc, status)
 
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=args.workers
                 ) as ex:
-                    for _ in ex.map(_probe, to_prefetch[:prefetch_n]):
-                        pass
+                    for pid, p, mtime, size, isrc, status in ex.map(_probe, to_prefetch[:prefetch_n]):
+                        # main thread: update DB and in-memory caches
+                        cache_upsert(cache_conn, pid, p, mtime or 0.0, size or 0, isrc, status)
+                        diag["isrc_cache_by_pid"][pid] = {
+                            "path": p, "mtime": mtime, "size": size,
+                            "isrc": isrc, "status": status, "updated": time.time(),
+                        }
+                        if status == 1 and isrc:
+                            diag["by_isrc"][isrc.upper()] = pid
                 cache_conn.commit()
                 diag["isrc_reads_left"] = max(0, args.max_tag_reads - prefetch_n)
 

@@ -46,35 +46,66 @@ The script:
 3. Creates minimal XML files containing only playlist references to existing tracks
 4. Only tracks already in your Music library will be added (streaming-only content is ignored)
 
-## Configuration
+## Advanced Usage
 
-Edit these variables in `csv_to_music_xml.py`:
+The converter now includes advanced matching algorithms and command-line options:
 
-```python
-LIB_XML = Path("data/MusicLibrary.xml")          # Music library export
-CSV_DIR = Path("data/spotify_csv")               # Spotify CSV folder
-OUT_DIR = Path("data/music_playlists_xml")       # Output directory
-DUR_TOLERANCE_SEC = 3                            # Duration matching tolerance
-USE_ALBUM_IN_MATCH = True                        # Use album for matching
-```
-
-## Debug Mode
-
-To diagnose why tracks aren't matching, run with debug environment variables:
+### Basic Options
 
 ```bash
-# Show detailed diagnostics for first 5 unmatched tracks per playlist
-DEBUG=1 uv run python csv_to_music_xml.py
+# Show help and all available options
+uv run python csv_to_music_xml.py --help
 
-# Limit to 3 failures per playlist, show 5 suggestions each
-DEBUG=1 DEBUG_LIMIT=3 SUGGESTIONS=5 uv run python csv_to_music_xml.py
+# Use custom file locations
+uv run python csv_to_music_xml.py --library ~/MusicLibrary.xml --csv-dir ~/spotify_exports --output ~/playlists
+
+# Debug unmatched tracks
+uv run python csv_to_music_xml.py --debug
+
+# More detailed debugging (show 10 failures per playlist, 5 suggestions each)
+uv run python csv_to_music_xml.py --debug --limit 10 --suggestions 5
 ```
 
-Debug mode shows:
-- Which matching keys were tried and whether they hit
-- Top candidate tracks with duration differences (Δt)
-- Similar titles/artists in your library
-- Whether removing qualifiers (remastered, feat., etc.) would help
+### ISRC Matching (Exact Track Identification)
+
+For the most accurate matching, enable ISRC-based identification:
+
+```bash
+# Enable smart ISRC matching with caching (recommended)
+uv run python csv_to_music_xml.py --isrc
+
+# Tune performance for large libraries
+uv run python csv_to_music_xml.py --isrc --max-tag-reads 1000 --workers 16
+
+# Skip album prefetching for faster startup
+uv run python csv_to_music_xml.py --isrc --isrc-prefetch none
+
+# Use custom cache location
+uv run python csv_to_music_xml.py --isrc --isrc-cache ~/music_isrc_cache.sqlite
+```
+
+ISRC matching provides:
+- **Exact track identification** when ISRCs are available
+- **Persistent caching** - subsequent runs are near-instant
+- **Smart prefetching** - only reads files for albums in your CSV exports
+- **Concurrent processing** - multi-threaded for fast performance
+
+### Matching Algorithm
+
+The converter uses a layered matching approach (in priority order):
+
+1. **ISRC exact match** - Zero ambiguity when available
+2. **Album + disc/track number** - Precise matching for well-tagged libraries  
+3. **Title simplification** - Strips "remastered", "feat.", etc. automatically
+4. **Fuzzy matching** - Token-set similarity for close matches
+5. **Adaptive duration tolerance** - 2% tolerance for longer tracks
+
+### Performance
+
+- **Fast**: Indexes 18k+ tracks in seconds
+- **Smart**: Only reads audio files when needed for ISRC matching
+- **Cached**: Persistent SQLite cache prevents re-reading unchanged files
+- **Concurrent**: Multi-threaded audio file processing
 
 ## Troubleshooting
 
