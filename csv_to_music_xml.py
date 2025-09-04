@@ -17,11 +17,18 @@ import difflib
 from pathlib import Path
 from unidecode import unidecode
 from collections import Counter, defaultdict
+from urllib.parse import unquote, urlparse
 try:
     from rapidfuzz import fuzz
     HAVE_RAPIDFUZZ = True
 except Exception:
     HAVE_RAPIDFUZZ = False
+try:
+    from mutagen import File as MutagenFile
+    from mutagen.mp4 import MP4
+    HAVE_MUTAGEN = True
+except Exception:
+    HAVE_MUTAGEN = False
 
 # ----- Configuration -----
 LIB_XML = Path("data/MusicLibrary.xml")             # exported from Music.app
@@ -33,6 +40,7 @@ REL_TOL = 0.02                                      # ±2% relative tolerance on
 DEBUG = int(os.environ.get("DEBUG", "0"))           # 0=off, 1=on
 DEBUG_LIMIT_PER_PLAYLIST = int(os.environ.get("DEBUG_LIMIT", "5"))
 SUGGESTIONS_PER_ROW = int(os.environ.get("SUGGESTIONS", "3"))
+USE_ISRC = int(os.environ.get("USE_ISRC", "0"))    # 0=off, 1=on (slow!)
 
 # ----- Helper Functions -----
 def norm(s):
@@ -84,8 +92,69 @@ def simplify_title(s: str) -> str:
         s = pat.sub(repl, s)
     return s.strip()
 
+def location_to_path(location_url):
+    """Convert iTunes file:// URL to local file path."""
+    if not location_url:
+        return None
+    try:
+        # Parse the URL and unquote special characters
+        parsed = urlparse(location_url)
+        if parsed.scheme == 'file':
+            # Remove 'localhost' if present, handle file:// URLs
+            path = parsed.path
+            if parsed.netloc == 'localhost':
+                path = parsed.path
+            # Unquote URL encoding (e.g., %20 -> space)
+            path = unquote(path)
+            return path
+    except:
+        pass
+    return None
+
+def extract_isrc_from_file(filepath):
+    """Extract ISRC from audio file using mutagen."""
+    if not HAVE_MUTAGEN or not filepath:
+        return None
+    
+    try:
+        audio = MutagenFile(filepath)
+        if audio is None:
+            return None
+        
+        # MP4/M4A files (iTunes)
+        if isinstance(audio, MP4):
+            # Try standard ISRC atom
+            if '----:com.apple.iTunes:ISRC' in audio:
+                isrc_data = audio['----:com.apple.iTunes:ISRC'][0]
+                if hasattr(isrc_data, 'decode'):
+                    return isrc_data.decode('utf-8').strip()
+                return str(isrc_data).strip()
+        
+        # ID3 tags (MP3, etc)
+        elif hasattr(audio, 'tags'):
+            tags = audio.tags
+            if tags:
+                # Standard ISRC frame
+                if 'TSRC' in tags:
+                    return str(tags['TSRC'][0]).strip()
+                # Sometimes stored in TXXX frames
+                for key, value in tags.items():
+                    if key.startswith('TXXX:') and 'ISRC' in key.upper():
+                        return str(value[0]).strip()
+        
+        # FLAC/Vorbis comments
+        elif hasattr(audio, 'get'):
+            if 'ISRC' in audio:
+                return str(audio['ISRC'][0]).strip()
+    
+    except Exception as e:
+        # Silently fail - ISRCs are optional
+        pass
+    
+    return None
+
 # ----- Load Music Library XML and Build Index -----
-def build_music_index():
+def build_music_index(extract_isrcs=False):
     """Parse Music.app Library XML and build searchable index."""
     if not LIB_XML.exists():
         print(f"ERROR: {LIB_XML} not found!")
@@ -103,12 +172,14 @@ def build_music_index():
     tracks = lib.get("Tracks", {})
     index = {}
     local_count = 0
+    isrc_count = 0
     
     # Auxiliary structures for diagnostics
     by_title = defaultdict(list)        # norm(title) -> [rec...]
     by_artist = defaultdict(list)       # norm(artist) -> [rec...]
     base_key_index = defaultdict(list)  # norm(artist)|norm(title) -> [rec...]
     by_album = defaultdict(list)        # norm(album) -> [rec...] with disc/track numbers
+    by_isrc = {}                        # ISRC -> rec (exact match)
     
     # Build index: (artist|title[|album]) -> list of {pid, track_id, secs}
     for tid, td in tracks.items():
@@ -122,6 +193,7 @@ def build_music_index():
         album = td.get("Album") or ""
         disc_no = td.get("Disc Number") or 1
         track_no = td.get("Track Number") or None
+        location = td.get("Location")
         secs = None
         
         if "Total Time" in td:
@@ -129,6 +201,17 @@ def build_music_index():
                 secs = round(td["Total Time"]/1000.0)
             except: 
                 pass
+        
+        # Try to extract ISRC from the audio file (only if requested)
+        isrc = None
+        if extract_isrcs and location:
+            filepath = location_to_path(location)
+            if filepath:
+                isrc = extract_isrc_from_file(filepath)
+                if isrc:
+                    isrc_count += 1
+                    if isrc_count % 100 == 0:
+                        print(f"  ...extracted {isrc_count} ISRCs so far...")
                 
         variants = key_variants(artist, title, album, td.get("Total Time"))
         na, nt, nal = norm(artist), norm(title), norm(album)
@@ -142,6 +225,8 @@ def build_music_index():
             "album": album,
             "disc_no": disc_no,
             "track_no": track_no,
+            "location": location,
+            "isrc": isrc,
         }
         
         # Add to diagnostic structures
@@ -153,6 +238,10 @@ def build_music_index():
         if nal:
             by_album[nal].append(rec)
         
+        # Add to ISRC index for exact matching
+        if isrc:
+            by_isrc[isrc] = rec
+        
         for (k, _csv_secs) in variants:
             bucket = index.setdefault(k, [])
             bucket.append(rec)
@@ -163,10 +252,14 @@ def build_music_index():
         "by_title": by_title,
         "by_artist": by_artist,
         "by_album": by_album,
+        "by_isrc": by_isrc,
         "base_key_index": base_key_index,
         "artists": set(by_artist.keys()),
         "titles": set(by_title.keys()),
     }
+    
+    if by_isrc:
+        print(f"Found {len(by_isrc)} tracks with ISRCs in library")
     
     return index, diag
 
@@ -224,7 +317,11 @@ def best_match(row, index, diag):
     disc_csv  = parse_int(row.get("Disc Number"))
     track_csv = parse_int(row.get("Track Number"))
     
-    # 0) Strong album+disc/track match first
+    # 0) ISRC exact match - highest priority
+    if isrc and isrc in diag["by_isrc"]:
+        return diag["by_isrc"][isrc]
+    
+    # 1) Strong album+disc/track match
     if album_norm and diag["by_album"].get(album_norm):
         candidates = diag["by_album"][album_norm]
         # Prefer exact disc/track, else fallback by closest duration
@@ -240,7 +337,7 @@ def best_match(row, index, diag):
         if near_title:
             return near_title[0]
     
-    # 1) Try multiple key variants with simplified title
+    # 2) Try multiple key variants with simplified title
     keys_to_try = []
     
     # Primary artist keys with both original and simplified titles
@@ -278,7 +375,7 @@ def best_match(row, index, diag):
             if cands:
                 return cands[0]
     
-    # 2) Optional guarded fuzzy fallback (only when we have album hit or duration guard)
+    # 3) Optional guarded fuzzy fallback (only when we have album hit or duration guard)
     if HAVE_RAPIDFUZZ:
         # search in album bucket if available, else scan all keys for artist match
         pool = diag["by_album"].get(album_norm, [])
@@ -490,12 +587,38 @@ def process_playlists(index, diag=None):
     return processed_count
 
 # ----- Main Entry Point -----
+def check_csvs_for_isrcs():
+    """Quick check if any CSV files contain ISRCs."""
+    if not CSV_DIR.exists():
+        return False
+    
+    csv_files = list(glob.glob(str(CSV_DIR / "*.csv")))[:5]  # Check first 5 files
+    for csv_path in csv_files:
+        try:
+            with open(csv_path, newline='', encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader):
+                    if i > 10:  # Check first 10 rows
+                        break
+                    isrc = (row.get("ISRC") or "").strip()
+                    if isrc and len(isrc) == 12:  # ISRCs are 12 chars
+                        return True
+        except:
+            pass
+    return False
+
 def main():
     print("CSV to Music.app XML Playlist Converter")
     print("=" * 40)
     
+    # Check if we should extract ISRCs
+    extract_isrcs = USE_ISRC and check_csvs_for_isrcs()
+    if extract_isrcs:
+        print("Found ISRCs in CSV files, will extract from audio files for matching...")
+        print("NOTE: ISRC extraction is slow! Disable with USE_ISRC=0 if needed.")
+    
     # Build index from Music Library
-    index, diag = build_music_index()
+    index, diag = build_music_index(extract_isrcs)
     
     # Process all CSV playlists
     processed = process_playlists(index, diag)
