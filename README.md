@@ -57,6 +57,24 @@ DUR_TOLERANCE_SEC = 3                            # Duration matching tolerance
 USE_ALBUM_IN_MATCH = True                        # Use album for matching
 ```
 
+## Debug Mode
+
+To diagnose why tracks aren't matching, run with debug environment variables:
+
+```bash
+# Show detailed diagnostics for first 5 unmatched tracks per playlist
+DEBUG=1 uv run python csv_to_music_xml.py
+
+# Limit to 3 failures per playlist, show 5 suggestions each
+DEBUG=1 DEBUG_LIMIT=3 SUGGESTIONS=5 uv run python csv_to_music_xml.py
+```
+
+Debug mode shows:
+- Which matching keys were tried and whether they hit
+- Top candidate tracks with duration differences (Δt)
+- Similar titles/artists in your library
+- Whether removing qualifiers (remastered, feat., etc.) would help
+
 ## Troubleshooting
 
 - **No matches found:** Check that track names/artists match between Spotify and your Music library

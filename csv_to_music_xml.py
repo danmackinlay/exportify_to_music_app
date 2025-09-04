@@ -13,8 +13,10 @@ import sys
 import os
 import glob
 import math
+import difflib
 from pathlib import Path
 from unidecode import unidecode
+from collections import Counter, defaultdict
 
 # ----- Configuration -----
 LIB_XML = Path("data/MusicLibrary.xml")             # exported from Music.app
@@ -22,6 +24,9 @@ CSV_DIR = Path("data/spotify_csv")                  # folder of Exportify CSVs
 OUT_DIR = Path("data/music_playlists_xml")          # where we write playlist XMLs
 DUR_TOLERANCE_SEC = 3                               # ± seconds allowed when matching
 USE_ALBUM_IN_MATCH = True                           # tighten matching when album is present
+DEBUG = int(os.environ.get("DEBUG", "0"))           # 0=off, 1=on
+DEBUG_LIMIT_PER_PLAYLIST = int(os.environ.get("DEBUG_LIMIT", "5"))
+SUGGESTIONS_PER_ROW = int(os.environ.get("SUGGESTIONS", "3"))
 
 # ----- Helper Functions -----
 def norm(s):
@@ -78,6 +83,11 @@ def build_music_index():
     index = {}
     local_count = 0
     
+    # Auxiliary structures for diagnostics
+    by_title = defaultdict(list)        # norm(title) -> [rec...]
+    by_artist = defaultdict(list)       # norm(artist) -> [rec...]
+    base_key_index = defaultdict(list)  # norm(artist)|norm(title) -> [rec...]
+    
     # Build index: (artist|title[|album]) -> list of {pid, track_id, secs}
     for tid, td in tracks.items():
         # Only index items that have a file location (local files)
@@ -97,20 +107,37 @@ def build_music_index():
                 pass
                 
         variants = key_variants(artist, title, album, td.get("Total Time"))
+        na, nt, nal = norm(artist), norm(title), norm(album)
+        
+        rec = {
+            "track_id": int(tid),
+            "pid": td.get("Persistent ID"),
+            "secs": secs,
+            "artist": artist,
+            "title": title,
+            "album": album,
+        }
+        
+        # Add to diagnostic structures
+        by_title[nt].append(rec)
+        by_artist[na].append(rec)
+        base_key_index[f"{na}|{nt}"].append(rec)
         
         for (k, _csv_secs) in variants:
             bucket = index.setdefault(k, [])
-            bucket.append({
-                "track_id": int(tid),
-                "pid": td.get("Persistent ID"),
-                "secs": secs,
-                "artist": artist,
-                "title": title,
-                "album": album,
-            })
+            bucket.append(rec)
     
     print(f"Indexed {local_count} local tracks from Music library")
-    return index
+    
+    diag = {
+        "by_title": by_title,
+        "by_artist": by_artist,
+        "base_key_index": base_key_index,
+        "artists": set(by_artist.keys()),
+        "titles": set(by_title.keys()),
+    }
+    
+    return index, diag
 
 # ----- Playlist XML Writer -----
 def write_playlist_xml(playlist_name, track_ids):
@@ -191,8 +218,102 @@ def best_match(row, index):
     
     return None
 
+# ----- Diagnostic Functions -----
+def summarize_candidate(c):
+    """Format a candidate track for display."""
+    return f"[id {c['track_id']}] {c['artist']} — {c['title']} · {c['album']} · {c['secs']}s"
+
+def simplify_title_normed(s: str) -> str:
+    """Strip common qualifiers: remastered, feat, radio edit, etc."""
+    s = re.sub(r"\s*-\s*(remaster(?:ed)?|mono|stereo|radio edit|edit|version|live|extended|deluxe).*$", "", s, flags=re.I)
+    s = re.sub(r"\s*\((?:feat\.?|featuring|with|remaster(?:ed)?|mono|stereo|radio edit|edit|version|live|extended).*?\)\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*\[.*?\]\s*$", "", s)
+    return s.strip()
+
+def diagnose_row(row, index, diag, playlist_name, emitted_count):
+    """Print why a row failed to match and suggest nearest candidates."""
+    title = row.get("Track Name", "") or row.get("track_name", "")
+    artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
+    album = row.get("Album Name", "") or row.get("album_name", "")
+    primary_artist = artists_field.split(",")[0].strip() if artists_field else ""
+    
+    ms = None
+    if row.get("Track Duration (ms)"):
+        try: 
+            ms = float(row["Track Duration (ms)"])
+        except: 
+            pass
+    
+    # Get all keys that would be tried
+    cand_keys = []
+    if primary_artist:
+        cand_keys += key_variants(primary_artist, title, album, ms)
+    if artists_field and artists_field != primary_artist:
+        cand_keys += key_variants(artists_field, title, album, ms)
+    
+    na, nt, nal = norm(primary_artist), norm(title), norm(album)
+    secs = round(float(ms)/1000.0) if ms else None
+    
+    print(f"\n— DEBUG({playlist_name}) #{emitted_count+1}")
+    print(f"  CSV: {artists_field} — {title} · {album} · {secs}s")
+    print(f"  norm: {na} — {nt} · {nal}")
+    print("  keys tried (order):")
+    
+    for k, _ in cand_keys:
+        present = k in index
+        count = len(index.get(k, []))
+        print(f"    • {k} -> {'HIT' if present else 'MISS'} ({count} candidate{'s' if count!=1 else ''})")
+        
+        if present:
+            # Show top 3 candidates nearest in duration
+            cands = index[k]
+            def score(c):
+                if secs is None or c['secs'] is None: 
+                    return 9999
+                return abs(c['secs'] - secs)
+            
+            for c in sorted(cands, key=score)[:min(3, len(cands))]:
+                d = None if secs is None or c['secs'] is None else c['secs'] - secs
+                print(f"        - {summarize_candidate(c)}  Δt={d}")
+    
+    # If all keys missed, provide suggestions
+    if all(k not in index for k, _ in cand_keys):
+        title_hits = diag['by_title'].get(nt, [])
+        if title_hits:
+            print("  Exact title exists in library (different artist/album):")
+            for c in title_hits[:SUGGESTIONS_PER_ROW]:
+                print(f"    · {summarize_candidate(c)}")
+        
+        artist_bucket = diag['by_artist'].get(na, [])
+        if artist_bucket:
+            ratios = [(difflib.SequenceMatcher(None, nt, norm(c['title'])).ratio(), c) for c in artist_bucket]
+            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:SUGGESTIONS_PER_ROW]
+            if top:
+                print("  Close titles for same artist (≥0.70):")
+                for c in top:
+                    print(f"    · {summarize_candidate(c)}")
+        
+        title_bucket = diag['by_title'].get(nt, [])
+        if title_bucket:
+            ratios = [(difflib.SequenceMatcher(None, na, norm(c['artist'])).ratio(), c) for c in title_bucket]
+            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:SUGGESTIONS_PER_ROW]
+            if top:
+                print("  Close artists for same title (≥0.70):")
+                for c in top:
+                    print(f"    · {summarize_candidate(c)}")
+        
+        # What-if: strip qualifiers from title
+        alt_nt = simplify_title_normed(nt)
+        if alt_nt != nt:
+            base_key = f"{na}|{alt_nt}"
+            bucket = diag['base_key_index'].get(base_key, [])
+            if bucket:
+                print("  Would match if title qualifiers removed:")
+                for c in bucket[:SUGGESTIONS_PER_ROW]:
+                    print(f"    · {summarize_candidate(c)}")
+
 # ----- Main Processing -----
-def process_playlists(index):
+def process_playlists(index, diag=None):
     """Process all CSV playlists and convert to XML."""
     if not CSV_DIR.exists():
         print(f"\nERROR: CSV directory '{CSV_DIR}' not found!")
@@ -215,6 +336,8 @@ def process_playlists(index):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     
     unmatched_report = []
+    unmatched_by_artist = Counter()
+    unmatched_by_title = Counter()
     processed_count = 0
     total_tracks = 0
     
@@ -222,6 +345,7 @@ def process_playlists(index):
         pl_name = Path(csv_path).stem
         track_ids = []
         unmatched_in_playlist = []
+        debug_emitted = 0
         
         with open(csv_path, newline='', encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -235,6 +359,13 @@ def process_playlists(index):
                     title = row.get("Track Name", "") or row.get("track_name", "")
                     unmatched_in_playlist.append((artist, title))
                     unmatched_report.append((pl_name, artist, title))
+                    unmatched_by_artist[norm(artist)] += 1
+                    unmatched_by_title[norm(title)] += 1
+                    
+                    # Debug diagnostics if enabled
+                    if DEBUG and diag and debug_emitted < DEBUG_LIMIT_PER_PLAYLIST:
+                        diagnose_row(row, index, diag, pl_name, debug_emitted)
+                        debug_emitted += 1
         
         if track_ids:
             out = write_playlist_xml(pl_name, track_ids)
@@ -262,6 +393,14 @@ def process_playlists(index):
     print(f"• Total tracks: {total_tracks}")
     print(f"• Output directory: {OUT_DIR}/")
     
+    if unmatched_report:
+        print(f"\nTop unmatched artists:")
+        for a, cnt in unmatched_by_artist.most_common(10):
+            print(f"  {a}  ×{cnt}")
+        print(f"\nTop unmatched titles:")
+        for t, cnt in unmatched_by_title.most_common(10):
+            print(f"  {t}  ×{cnt}")
+    
     return processed_count
 
 # ----- Main Entry Point -----
@@ -270,10 +409,10 @@ def main():
     print("=" * 40)
     
     # Build index from Music Library
-    index = build_music_index()
+    index, diag = build_music_index()
     
     # Process all CSV playlists
-    processed = process_playlists(index)
+    processed = process_playlists(index, diag)
     
     if processed > 0:
         print("\nNext steps:")
