@@ -14,33 +14,22 @@ import os
 import glob
 import math
 import difflib
+import argparse
 from pathlib import Path
 from unidecode import unidecode
 from collections import Counter, defaultdict
 from urllib.parse import unquote, urlparse
-try:
-    from rapidfuzz import fuzz
-    HAVE_RAPIDFUZZ = True
-except Exception:
-    HAVE_RAPIDFUZZ = False
-try:
-    from mutagen import File as MutagenFile
-    from mutagen.mp4 import MP4
-    HAVE_MUTAGEN = True
-except Exception:
-    HAVE_MUTAGEN = False
+from rapidfuzz import fuzz
+from mutagen import File as MutagenFile
+from mutagen.mp4 import MP4
 
-# ----- Configuration -----
-LIB_XML = Path("data/MusicLibrary.xml")             # exported from Music.app
-CSV_DIR = Path("data/spotify_csv")                  # folder of Exportify CSVs  
-OUT_DIR = Path("data/music_playlists_xml")          # where we write playlist XMLs
+# ----- Default Configuration -----
+DEFAULT_LIB_XML = Path("data/MusicLibrary.xml")
+DEFAULT_CSV_DIR = Path("data/spotify_csv")
+DEFAULT_OUT_DIR = Path("data/music_playlists_xml")
 DUR_TOLERANCE_SEC = 3                               # ± seconds allowed when matching
 USE_ALBUM_IN_MATCH = True                           # tighten matching when album is present
 REL_TOL = 0.02                                      # ±2% relative tolerance on duration (adaptive)
-DEBUG = int(os.environ.get("DEBUG", "0"))           # 0=off, 1=on
-DEBUG_LIMIT_PER_PLAYLIST = int(os.environ.get("DEBUG_LIMIT", "5"))
-SUGGESTIONS_PER_ROW = int(os.environ.get("SUGGESTIONS", "3"))
-USE_ISRC = int(os.environ.get("USE_ISRC", "0"))    # 0=off, 1=on (slow!)
 
 # ----- Helper Functions -----
 def norm(s):
@@ -59,7 +48,7 @@ def key_variants(artist, title, album, ms):
     secs = None
     try: 
         secs = round(float(ms)/1000.0) if ms else None
-    except: 
+    except (ValueError, TypeError): 
         pass
     
     keys = []
@@ -75,7 +64,8 @@ def dur_close(a, b, tol=DUR_TOLERANCE_SEC, rel=REL_TOL):
     """Check if two durations are within tolerance."""
     if a is None or b is None: 
         return True  # duration unknown -> allow
-    a = int(a); b = int(b)
+    a = int(a)
+    b = int(b)
     adaptive = max(tol, math.ceil(rel * max(a, b)))
     return abs(a - b) <= adaptive
 
@@ -107,13 +97,13 @@ def location_to_path(location_url):
             # Unquote URL encoding (e.g., %20 -> space)
             path = unquote(path)
             return path
-    except:
+    except Exception:
         pass
     return None
 
 def extract_isrc_from_file(filepath):
     """Extract ISRC from audio file using mutagen."""
-    if not HAVE_MUTAGEN or not filepath:
+    if not filepath:
         return None
     
     try:
@@ -147,26 +137,26 @@ def extract_isrc_from_file(filepath):
             if 'ISRC' in audio:
                 return str(audio['ISRC'][0]).strip()
     
-    except Exception as e:
+    except Exception:
         # Silently fail - ISRCs are optional
         pass
     
     return None
 
 # ----- Load Music Library XML and Build Index -----
-def build_music_index(extract_isrcs=False):
+def build_music_index(lib_xml, extract_isrcs=False):
     """Parse Music.app Library XML and build searchable index."""
-    if not LIB_XML.exists():
-        print(f"ERROR: {LIB_XML} not found!")
+    if not lib_xml.exists():
+        print(f"ERROR: {lib_xml} not found!")
         print("\nTo export your Music Library:")
         print("1. Open Music.app")
         print("2. Go to File → Library → Export Library...")
         print("3. Save as 'MusicLibrary.xml' in this directory")
         sys.exit(1)
     
-    print(f"Loading Music library from {LIB_XML}...")
+    print(f"Loading Music library from {lib_xml}...")
     
-    with open(LIB_XML, 'rb') as f:
+    with open(lib_xml, 'rb') as f:
         lib = plistlib.load(f)
     
     tracks = lib.get("Tracks", {})
@@ -199,7 +189,7 @@ def build_music_index(extract_isrcs=False):
         if "Total Time" in td:
             try: 
                 secs = round(td["Total Time"]/1000.0)
-            except: 
+            except (ValueError, TypeError, KeyError): 
                 pass
         
         # Try to extract ISRC from the audio file (only if requested)
@@ -264,7 +254,7 @@ def build_music_index(extract_isrcs=False):
     return index, diag
 
 # ----- Playlist XML Writer -----
-def write_playlist_xml(playlist_name, track_ids):
+def write_playlist_xml(playlist_name, track_ids, out_dir):
     """Write minimal iTunes/Music XML containing just playlist entries."""
     plist = {
         "Major Version": 1,
@@ -282,7 +272,7 @@ def write_playlist_xml(playlist_name, track_ids):
         }]
     }
     
-    out = OUT_DIR / f"{playlist_name}.xml"
+    out = out_dir / f"{playlist_name}.xml"
     with open(out, "wb") as fh:
         plistlib.dump(plist, fh, sort_keys=False)
     return out
@@ -306,14 +296,16 @@ def best_match(row, index, diag):
     if row.get("Track Duration (ms)"):
         try: 
             ms = float(row["Track Duration (ms)"])
-        except: 
+        except (ValueError, TypeError, KeyError): 
             pass
     secs = round(ms/1000.0) if ms else None
     
     # Parse disc and track numbers from CSV
     def parse_int(x):
-        try: return int(str(x).strip())
-        except: return None
+        try:
+            return int(str(x).strip())
+        except (ValueError, TypeError, AttributeError):
+            return None
     disc_csv  = parse_int(row.get("Disc Number"))
     track_csv = parse_int(row.get("Track Number"))
     
@@ -376,28 +368,29 @@ def best_match(row, index, diag):
                 return cands[0]
     
     # 3) Optional guarded fuzzy fallback (only when we have album hit or duration guard)
-    if HAVE_RAPIDFUZZ:
-        # search in album bucket if available, else scan all keys for artist match
-        pool = diag["by_album"].get(album_norm, [])
-        if not pool and primary_artist:
-            # cheap pool: all entries reachable via primary_artist+any title key
-            pa = norm(primary_artist)
-            pool = []
-            # gather all tracks by scanning index buckets that start with pa|
-            for k, lst in index.items():
-                if k.startswith(f"{pa}|"):
-                    pool.extend(lst)
-        if pool:
-            best = None; best_score = 0
-            nt = norm(title_simpl or title)
-            for c in pool:
-                if secs is not None and c["secs"] is not None and not dur_close(c["secs"], secs):
-                    continue
-                score = fuzz.token_set_ratio(nt, norm(c["title"]))
-                if score > best_score:
-                    best = c; best_score = score
-            if best and best_score >= 95:
-                return best
+    # search in album bucket if available, else scan all keys for artist match
+    pool = diag["by_album"].get(album_norm, [])
+    if not pool and primary_artist:
+        # cheap pool: all entries reachable via primary_artist+any title key
+        pa = norm(primary_artist)
+        pool = []
+        # gather all tracks by scanning index buckets that start with pa|
+        for k, lst in index.items():
+            if k.startswith(f"{pa}|"):
+                pool.extend(lst)
+    if pool:
+        best = None
+        best_score = 0
+        nt = norm(title_simpl or title)
+        for c in pool:
+            if secs is not None and c["secs"] is not None and not dur_close(c["secs"], secs):
+                continue
+            score = fuzz.token_set_ratio(nt, norm(c["title"]))
+            if score > best_score:
+                best = c
+                best_score = score
+        if best and best_score >= 95:
+            return best
     
     return None
 
@@ -413,7 +406,7 @@ def simplify_title_normed(s: str) -> str:
     s = re.sub(r"\s*\[.*?\]\s*$", "", s)
     return s.strip()
 
-def diagnose_row(row, index, diag, playlist_name, emitted_count):
+def diagnose_row(row, index, diag, playlist_name, emitted_count, suggestions_per_row):
     """Print why a row failed to match and suggest nearest candidates."""
     title = row.get("Track Name", "") or row.get("track_name", "")
     artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
@@ -424,7 +417,7 @@ def diagnose_row(row, index, diag, playlist_name, emitted_count):
     if row.get("Track Duration (ms)"):
         try: 
             ms = float(row["Track Duration (ms)"])
-        except: 
+        except (ValueError, TypeError, KeyError): 
             pass
     
     # Get all keys that would be tried
@@ -464,13 +457,13 @@ def diagnose_row(row, index, diag, playlist_name, emitted_count):
         title_hits = diag['by_title'].get(nt, [])
         if title_hits:
             print("  Exact title exists in library (different artist/album):")
-            for c in title_hits[:SUGGESTIONS_PER_ROW]:
+            for c in title_hits[:suggestions_per_row]:
                 print(f"    · {summarize_candidate(c)}")
         
         artist_bucket = diag['by_artist'].get(na, [])
         if artist_bucket:
             ratios = [(difflib.SequenceMatcher(None, nt, norm(c['title'])).ratio(), c) for c in artist_bucket]
-            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:SUGGESTIONS_PER_ROW]
+            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:suggestions_per_row]
             if top:
                 print("  Close titles for same artist (≥0.70):")
                 for c in top:
@@ -479,7 +472,7 @@ def diagnose_row(row, index, diag, playlist_name, emitted_count):
         title_bucket = diag['by_title'].get(nt, [])
         if title_bucket:
             ratios = [(difflib.SequenceMatcher(None, na, norm(c['artist'])).ratio(), c) for c in title_bucket]
-            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:SUGGESTIONS_PER_ROW]
+            top = [c for r, c in sorted(ratios, key=lambda x: x[0], reverse=True) if r >= 0.70][:suggestions_per_row]
             if top:
                 print("  Close artists for same title (≥0.70):")
                 for c in top:
@@ -492,14 +485,14 @@ def diagnose_row(row, index, diag, playlist_name, emitted_count):
             bucket = diag['base_key_index'].get(base_key, [])
             if bucket:
                 print("  Would match if title qualifiers removed:")
-                for c in bucket[:SUGGESTIONS_PER_ROW]:
+                for c in bucket[:suggestions_per_row]:
                     print(f"    · {summarize_candidate(c)}")
 
 # ----- Main Processing -----
-def process_playlists(index, diag=None):
+def process_playlists(index, diag, args):
     """Process all CSV playlists and convert to XML."""
-    if not CSV_DIR.exists():
-        print(f"\nERROR: CSV directory '{CSV_DIR}' not found!")
+    if not args.csv_dir.exists():
+        print(f"\nERROR: CSV directory '{args.csv_dir}' not found!")
         print("\nTo export your Spotify playlists:")
         print("1. Go to https://exportify.net")
         print("2. Log in with Spotify")
@@ -507,16 +500,16 @@ def process_playlists(index, diag=None):
         print("4. Extract the ZIP to a folder called 'spotify_csv' in this directory")
         sys.exit(1)
     
-    csv_files = list(glob.glob(str(CSV_DIR / "*.csv")))
+    csv_files = list(glob.glob(str(args.csv_dir / "*.csv")))
     
     if not csv_files:
-        print(f"\nNo CSV files found in {CSV_DIR}/")
+        print(f"\nNo CSV files found in {args.csv_dir}/")
         print("Make sure you've extracted your Exportify export to this directory.")
         sys.exit(1)
     
     print(f"\nFound {len(csv_files)} CSV playlists to process")
     
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    args.output.mkdir(parents=True, exist_ok=True)
     
     unmatched_report = []
     unmatched_by_artist = Counter()
@@ -546,12 +539,12 @@ def process_playlists(index, diag=None):
                     unmatched_by_title[norm(title)] += 1
                     
                     # Debug diagnostics if enabled
-                    if DEBUG and diag and debug_emitted < DEBUG_LIMIT_PER_PLAYLIST:
-                        diagnose_row(row, index, diag, pl_name, debug_emitted)
+                    if args.debug and diag and debug_emitted < args.limit:
+                        diagnose_row(row, index, diag, pl_name, debug_emitted, args.suggestions)
                         debug_emitted += 1
         
         if track_ids:
-            out = write_playlist_xml(pl_name, track_ids)
+            write_playlist_xml(pl_name, track_ids, args.output)
             processed_count += 1
             total_tracks += len(track_ids)
             print(f"✓ {pl_name}: {len(track_ids)} tracks matched", end="")
@@ -564,7 +557,7 @@ def process_playlists(index, diag=None):
     
     # Save unmatched report
     if unmatched_report:
-        rpt = OUT_DIR / "_unmatched.tsv"
+        rpt = args.output / "_unmatched.tsv"
         with open(rpt, "w", encoding="utf-8") as fh:
             fh.write("Playlist\tArtist\tTrack\n")
             for pl, a, t in unmatched_report:
@@ -574,25 +567,25 @@ def process_playlists(index, diag=None):
     print(f"\nConversion complete!")
     print(f"• Processed {processed_count}/{len(csv_files)} playlists")
     print(f"• Total tracks: {total_tracks}")
-    print(f"• Output directory: {OUT_DIR}/")
+    print(f"• Output directory: {args.output}/")
     
     if unmatched_report:
-        print(f"\nTop unmatched artists:")
+        print("\nTop unmatched artists:")
         for a, cnt in unmatched_by_artist.most_common(10):
             print(f"  {a}  ×{cnt}")
-        print(f"\nTop unmatched titles:")
+        print("\nTop unmatched titles:")
         for t, cnt in unmatched_by_title.most_common(10):
             print(f"  {t}  ×{cnt}")
     
     return processed_count
 
 # ----- Main Entry Point -----
-def check_csvs_for_isrcs():
+def check_csvs_for_isrcs(csv_dir):
     """Quick check if any CSV files contain ISRCs."""
-    if not CSV_DIR.exists():
+    if not csv_dir.exists():
         return False
     
-    csv_files = list(glob.glob(str(CSV_DIR / "*.csv")))[:5]  # Check first 5 files
+    csv_files = list(glob.glob(str(csv_dir / "*.csv")))[:5]  # Check first 5 files
     for csv_path in csv_files:
         try:
             with open(csv_path, newline='', encoding="utf-8") as f:
@@ -603,31 +596,71 @@ def check_csvs_for_isrcs():
                     isrc = (row.get("ISRC") or "").strip()
                     if isrc and len(isrc) == 12:  # ISRCs are 12 chars
                         return True
-        except:
+        except Exception:
             pass
     return False
 
+def create_parser():
+    """Create and configure the argument parser."""
+    parser = argparse.ArgumentParser(
+        description='Convert Spotify CSV playlists to Music.app XML format',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                           # Basic conversion
+  %(prog)s --debug                  # Show diagnostics for unmatched tracks
+  %(prog)s --debug --limit 10       # Show more debug info per playlist
+  %(prog)s --isrc                   # Enable ISRC matching (slow but accurate)
+  %(prog)s --library ~/Music.xml    # Use custom library location
+        """
+    )
+    
+    # File locations
+    parser.add_argument('--library', type=Path, default=DEFAULT_LIB_XML,
+                        help='Music library XML file (default: %(default)s)')
+    parser.add_argument('--csv-dir', type=Path, default=DEFAULT_CSV_DIR,
+                        help='Directory containing Spotify CSV files (default: %(default)s)')
+    parser.add_argument('--output', type=Path, default=DEFAULT_OUT_DIR,
+                        help='Output directory for playlist XML files (default: %(default)s)')
+    
+    # Matching options
+    parser.add_argument('--isrc', action='store_true',
+                        help='Extract ISRCs from audio files for exact matching (slow but accurate)')
+    
+    # Debug options
+    parser.add_argument('--debug', action='store_true',
+                        help='Show diagnostic info for unmatched tracks')
+    parser.add_argument('--limit', type=int, default=5, metavar='N',
+                        help='Number of unmatched tracks to diagnose per playlist (default: %(default)s)')
+    parser.add_argument('--suggestions', type=int, default=3, metavar='N',
+                        help='Number of suggestions to show per unmatched track (default: %(default)s)')
+    
+    return parser
+
 def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    
     print("CSV to Music.app XML Playlist Converter")
     print("=" * 40)
     
     # Check if we should extract ISRCs
-    extract_isrcs = USE_ISRC and check_csvs_for_isrcs()
+    extract_isrcs = args.isrc and check_csvs_for_isrcs(args.csv_dir)
     if extract_isrcs:
         print("Found ISRCs in CSV files, will extract from audio files for matching...")
-        print("NOTE: ISRC extraction is slow! Disable with USE_ISRC=0 if needed.")
+        print("NOTE: ISRC extraction is slow! Consider running without --isrc first.")
     
     # Build index from Music Library
-    index, diag = build_music_index(extract_isrcs)
+    index, diag = build_music_index(args.library, extract_isrcs)
     
     # Process all CSV playlists
-    processed = process_playlists(index, diag)
+    processed = process_playlists(index, diag, args)
     
     if processed > 0:
         print("\nNext steps:")
         print("1. Open Music.app")
         print("2. Go to File → Library → Import Playlist...")
-        print("3. Select all XML files in 'music_playlists_xml/' (Cmd+A)")
+        print(f"3. Select all XML files in '{args.output}/' (Cmd+A)")
         print("4. Click 'Open'")
         print("5. Your playlists will appear in Music.app and djay Pro!")
         print("\nNote: Only tracks already in your Music library will be added.")
