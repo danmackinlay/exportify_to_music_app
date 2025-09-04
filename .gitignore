@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# User data - do not commit
+data/
+*.csv
+MusicLibrary.xml
+music_playlists_xml/
+
+# But keep the data directory structure
+!data/.gitkeep

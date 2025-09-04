@@ -12,14 +12,14 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 
 1. **Export your Music library:**
    - Open Music.app
-   - File ’ Library ’ Export Library...
-   - Save as `MusicLibrary.xml` in this directory
+   - File ï¿½ Library ï¿½ Export Library...
+   - Save as `MusicLibrary.xml` in the `data/` directory
 
 2. **Export Spotify playlists:**
    - Visit https://exportify.net
    - Log in with Spotify
    - Click "Export All"
-   - Extract the ZIP to `spotify_csv/` folder in this directory
+   - Extract the ZIP to `data/spotify_csv/` folder
 
 3. **Run the converter:**
    ```bash
@@ -28,8 +28,8 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 
 4. **Import to Music.app:**
    - Open Music.app
-   - File ’ Library ’ Import Playlist...
-   - Select all files in `music_playlists_xml/` (Cmd+A)
+   - File ï¿½ Library ï¿½ Import Playlist...
+   - Select all files in `data/music_playlists_xml/` (Cmd+A)
    - Click Open
 
 5. **Use in djay Pro:**
@@ -50,11 +50,11 @@ The script:
 Edit these variables in `csv_to_music_xml.py`:
 
 ```python
-LIB_XML = Path("MusicLibrary.xml")     # Music library export
-CSV_DIR = Path("spotify_csv")          # Spotify CSV folder
-OUT_DIR = Path("music_playlists_xml")  # Output directory
-DUR_TOLERANCE_SEC = 3                  # Duration matching tolerance
-USE_ALBUM_IN_MATCH = True              # Use album for matching
+LIB_XML = Path("data/MusicLibrary.xml")          # Music library export
+CSV_DIR = Path("data/spotify_csv")               # Spotify CSV folder
+OUT_DIR = Path("data/music_playlists_xml")       # Output directory
+DUR_TOLERANCE_SEC = 3                            # Duration matching tolerance
+USE_ALBUM_IN_MATCH = True                        # Use album for matching
 ```
 
 ## Troubleshooting

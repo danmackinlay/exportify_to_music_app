@@ -17,9 +17,9 @@ from pathlib import Path
 from unidecode import unidecode
 
 # ----- Configuration -----
-LIB_XML = Path("MusicLibrary.xml")                  # exported from Music.app
-CSV_DIR = Path("spotify_csv")                       # folder of Exportify CSVs  
-OUT_DIR = Path("music_playlists_xml")               # where we write playlist XMLs
+LIB_XML = Path("data/MusicLibrary.xml")             # exported from Music.app
+CSV_DIR = Path("data/spotify_csv")                  # folder of Exportify CSVs  
+OUT_DIR = Path("data/music_playlists_xml")          # where we write playlist XMLs
 DUR_TOLERANCE_SEC = 3                               # ± seconds allowed when matching
 USE_ALBUM_IN_MATCH = True                           # tighten matching when album is present
 
@@ -139,25 +139,41 @@ def write_playlist_xml(playlist_name, track_ids):
 # ----- Track Matching -----
 def best_match(row, index):
     """Find best matching track in Music library for a CSV row."""
-    # Try various column name variants
-    artist = row.get("Artist Name") or row.get("Artist") or row.get("artist") or ""
-    title = row.get("Track Name") or row.get("track_name") or row.get("Track") or row.get("track") or ""
-    album = row.get("Album Name") or row.get("album") or ""
+    # Read Exportify's exact column names
+    title = row.get("Track Name", "") or row.get("track_name", "")
+    artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
+    album = row.get("Album Name", "") or row.get("album_name", "")
+    isrc = (row.get("ISRC") or "").strip()
     
-    # Try to extract duration
+    # Handle multiple artists - take first as primary, but also try full string
+    primary_artist = artists_field.split(",")[0].strip() if artists_field else ""
+    
+    # Extract duration from Exportify's column name
     ms = None
-    dur_fields = ["Duration (ms)", "duration_ms", "Duration"]
-    for df in dur_fields:
-        if df in row and str(row[df]).strip():
-            try:
-                ms = float(row[df])
-                break
-            except: 
-                pass
+    if row.get("Track Duration (ms)"):
+        try: 
+            ms = float(row["Track Duration (ms)"])
+        except: 
+            pass
     
-    cand_keys = key_variants(artist, title, album, ms)
+    # Try multiple key variants for better matching
+    # 1. Primary artist (first in list) with title
+    # 2. Full artist string with title  
+    # 3. With album if available
+    keys_to_try = []
     
-    for (k, csv_secs) in cand_keys:
+    # Primary artist keys
+    if primary_artist:
+        prim_keys = key_variants(primary_artist, title, album, ms)
+        keys_to_try.extend(prim_keys)
+    
+    # Full artist string keys (if different from primary)
+    if artists_field and artists_field != primary_artist:
+        full_keys = key_variants(artists_field, title, album, ms)
+        keys_to_try.extend(full_keys)
+    
+    # Try each key variant
+    for (k, csv_secs) in keys_to_try:
         if k in index:
             # Choose candidate with closest duration
             cands = sorted(
@@ -170,7 +186,8 @@ def best_match(row, index):
                     return c
             
             # Fallback to first candidate if no duration match
-            return cands[0]
+            if cands:
+                return cands[0]
     
     return None
 
@@ -213,8 +230,9 @@ def process_playlists(index):
                 if m:
                     track_ids.append(m["track_id"])
                 else:
-                    artist = row.get("Artist Name") or row.get("Artist") or row.get("artist") or ""
-                    title = row.get("Track Name") or row.get("Track") or row.get("track") or row.get("title") or ""
+                    # Use the exact column names from Exportify
+                    artist = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
+                    title = row.get("Track Name", "") or row.get("track_name", "")
                     unmatched_in_playlist.append((artist, title))
                     unmatched_report.append((pl_name, artist, title))
         
