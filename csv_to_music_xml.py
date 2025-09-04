@@ -17,6 +17,11 @@ import difflib
 from pathlib import Path
 from unidecode import unidecode
 from collections import Counter, defaultdict
+try:
+    from rapidfuzz import fuzz
+    HAVE_RAPIDFUZZ = True
+except Exception:
+    HAVE_RAPIDFUZZ = False
 
 # ----- Configuration -----
 LIB_XML = Path("data/MusicLibrary.xml")             # exported from Music.app
@@ -24,6 +29,7 @@ CSV_DIR = Path("data/spotify_csv")                  # folder of Exportify CSVs
 OUT_DIR = Path("data/music_playlists_xml")          # where we write playlist XMLs
 DUR_TOLERANCE_SEC = 3                               # ± seconds allowed when matching
 USE_ALBUM_IN_MATCH = True                           # tighten matching when album is present
+REL_TOL = 0.02                                      # ±2% relative tolerance on duration (adaptive)
 DEBUG = int(os.environ.get("DEBUG", "0"))           # 0=off, 1=on
 DEBUG_LIMIT_PER_PLAYLIST = int(os.environ.get("DEBUG_LIMIT", "5"))
 SUGGESTIONS_PER_ROW = int(os.environ.get("SUGGESTIONS", "3"))
@@ -57,11 +63,26 @@ def key_variants(artist, title, album, ms):
     
     return keys
 
-def dur_close(a, b, tol=DUR_TOLERANCE_SEC):
+def dur_close(a, b, tol=DUR_TOLERANCE_SEC, rel=REL_TOL):
     """Check if two durations are within tolerance."""
     if a is None or b is None: 
         return True  # duration unknown -> allow
-    return abs(int(a) - int(b)) <= tol
+    a = int(a); b = int(b)
+    adaptive = max(tol, math.ceil(rel * max(a, b)))
+    return abs(a - b) <= adaptive
+
+_SIMPLIFY_PATTERNS = [
+    (re.compile(r"\s*-\s*(remaster(?:ed)?|mono|stereo|radio edit|edit|version|live|extended|deluxe).*$", re.I), ""),
+    (re.compile(r"\s*\((?:feat\.?|featuring|with|remaster(?:ed)?|mono|stereo|radio edit|edit|version|live|extended).*?\)\s*$", re.I), ""),
+    (re.compile(r"\s*\[.*?\]\s*$"), ""),
+]
+
+def simplify_title(s: str) -> str:
+    """Strip common qualifiers: remastered, feat, radio edit, etc."""
+    s = s or ""
+    for pat, repl in _SIMPLIFY_PATTERNS:
+        s = pat.sub(repl, s)
+    return s.strip()
 
 # ----- Load Music Library XML and Build Index -----
 def build_music_index():
@@ -87,6 +108,7 @@ def build_music_index():
     by_title = defaultdict(list)        # norm(title) -> [rec...]
     by_artist = defaultdict(list)       # norm(artist) -> [rec...]
     base_key_index = defaultdict(list)  # norm(artist)|norm(title) -> [rec...]
+    by_album = defaultdict(list)        # norm(album) -> [rec...] with disc/track numbers
     
     # Build index: (artist|title[|album]) -> list of {pid, track_id, secs}
     for tid, td in tracks.items():
@@ -98,6 +120,8 @@ def build_music_index():
         artist = td.get("Artist") or td.get("Album Artist") or ""
         title = td.get("Name") or ""
         album = td.get("Album") or ""
+        disc_no = td.get("Disc Number") or 1
+        track_no = td.get("Track Number") or None
         secs = None
         
         if "Total Time" in td:
@@ -116,12 +140,18 @@ def build_music_index():
             "artist": artist,
             "title": title,
             "album": album,
+            "disc_no": disc_no,
+            "track_no": track_no,
         }
         
         # Add to diagnostic structures
         by_title[nt].append(rec)
         by_artist[na].append(rec)
         base_key_index[f"{na}|{nt}"].append(rec)
+        
+        # Add to album index
+        if nal:
+            by_album[nal].append(rec)
         
         for (k, _csv_secs) in variants:
             bucket = index.setdefault(k, [])
@@ -132,6 +162,7 @@ def build_music_index():
     diag = {
         "by_title": by_title,
         "by_artist": by_artist,
+        "by_album": by_album,
         "base_key_index": base_key_index,
         "artists": set(by_artist.keys()),
         "titles": set(by_title.keys()),
@@ -164,12 +195,14 @@ def write_playlist_xml(playlist_name, track_ids):
     return out
 
 # ----- Track Matching -----
-def best_match(row, index):
+def best_match(row, index, diag):
     """Find best matching track in Music library for a CSV row."""
     # Read Exportify's exact column names
     title = row.get("Track Name", "") or row.get("track_name", "")
+    title_simpl = simplify_title(title)
     artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
     album = row.get("Album Name", "") or row.get("album_name", "")
+    album_norm = norm(album)
     isrc = (row.get("ISRC") or "").strip()
     
     # Handle multiple artists - take first as primary, but also try full string
@@ -182,20 +215,49 @@ def best_match(row, index):
             ms = float(row["Track Duration (ms)"])
         except: 
             pass
+    secs = round(ms/1000.0) if ms else None
     
-    # Try multiple key variants for better matching
-    # 1. Primary artist (first in list) with title
-    # 2. Full artist string with title  
-    # 3. With album if available
+    # Parse disc and track numbers from CSV
+    def parse_int(x):
+        try: return int(str(x).strip())
+        except: return None
+    disc_csv  = parse_int(row.get("Disc Number"))
+    track_csv = parse_int(row.get("Track Number"))
+    
+    # 0) Strong album+disc/track match first
+    if album_norm and diag["by_album"].get(album_norm):
+        candidates = diag["by_album"][album_norm]
+        # Prefer exact disc/track, else fallback by closest duration
+        exact = [c for c in candidates if (track_csv and c["track_no"] == track_csv) and ((disc_csv or 1) == (c["disc_no"] or 1))]
+        if exact:
+            # duration guard if available
+            if secs is None or any(dur_close(c["secs"], secs) for c in exact):
+                return sorted(exact, key=lambda c: 0 if secs is None else abs((c["secs"] or 0) - secs))[0]
+        # fallback: same album, same (simplified) title within duration band
+        simp_nt = norm(title_simpl)
+        near = [c for c in candidates if dur_close(c["secs"], secs)]
+        near_title = [c for c in near if norm(simplify_title(c["title"])) == simp_nt]
+        if near_title:
+            return near_title[0]
+    
+    # 1) Try multiple key variants with simplified title
     keys_to_try = []
     
-    # Primary artist keys
+    # Primary artist keys with both original and simplified titles
     if primary_artist:
+        # Try simplified title first
+        if title_simpl != title:
+            prim_keys_simpl = key_variants(primary_artist, title_simpl, album, ms)
+            keys_to_try.extend(prim_keys_simpl)
+        # Then original title
         prim_keys = key_variants(primary_artist, title, album, ms)
         keys_to_try.extend(prim_keys)
     
     # Full artist string keys (if different from primary)
     if artists_field and artists_field != primary_artist:
+        if title_simpl != title:
+            full_keys_simpl = key_variants(artists_field, title_simpl, album, ms)
+            keys_to_try.extend(full_keys_simpl)
         full_keys = key_variants(artists_field, title, album, ms)
         keys_to_try.extend(full_keys)
     
@@ -215,6 +277,30 @@ def best_match(row, index):
             # Fallback to first candidate if no duration match
             if cands:
                 return cands[0]
+    
+    # 2) Optional guarded fuzzy fallback (only when we have album hit or duration guard)
+    if HAVE_RAPIDFUZZ:
+        # search in album bucket if available, else scan all keys for artist match
+        pool = diag["by_album"].get(album_norm, [])
+        if not pool and primary_artist:
+            # cheap pool: all entries reachable via primary_artist+any title key
+            pa = norm(primary_artist)
+            pool = []
+            # gather all tracks by scanning index buckets that start with pa|
+            for k, lst in index.items():
+                if k.startswith(f"{pa}|"):
+                    pool.extend(lst)
+        if pool:
+            best = None; best_score = 0
+            nt = norm(title_simpl or title)
+            for c in pool:
+                if secs is not None and c["secs"] is not None and not dur_close(c["secs"], secs):
+                    continue
+                score = fuzz.token_set_ratio(nt, norm(c["title"]))
+                if score > best_score:
+                    best = c; best_score = score
+            if best and best_score >= 95:
+                return best
     
     return None
 
@@ -350,7 +436,7 @@ def process_playlists(index, diag=None):
         with open(csv_path, newline='', encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                m = best_match(row, index)
+                m = best_match(row, index, diag)
                 if m:
                     track_ids.append(m["track_id"])
                 else:
