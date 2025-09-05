@@ -175,6 +175,49 @@ def simplify_title(s: str) -> str:
     return s.strip()
 
 
+_ALBUM_QUAL_PATTERNS = [
+    (re.compile(r"\s*\((?:deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*?\)\s*$", re.I), ""),
+    (re.compile(r"\s*-\s*(deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*$", re.I), ""),
+    (re.compile(r"\s*\[(?:deluxe|expanded|remaster(?:ed)?(?:\s*\d{2,4})?|edition|version).*?\]\s*$", re.I), ""),
+    # Singles/EP adornments
+    (re.compile(r"\s*\((?:single|maxi single|single version|ep|digital(?:\s*45)?)\)\s*$", re.I), ""),
+    (re.compile(r"\s*-\s*(?:single|maxi single|single version|ep)\s*$", re.I), ""),
+]
+
+
+def simplify_album(s: str) -> str:
+    """Strip common album qualifiers: deluxe, remastered, edition, etc."""
+    s = s or ""
+    for pat, repl in _ALBUM_QUAL_PATTERNS:
+        s = pat.sub(repl, s)
+    return s.strip()
+
+
+_VA_SET = {"various artists", "v.a.", "va", "various"}
+
+
+def is_va(name: str) -> bool:
+    """Check if artist name indicates Various Artists."""
+    return norm(name) in _VA_SET
+
+
+def looks_compilation(album_name: str, album_artist: str, lib_flag: bool | None = None) -> bool:
+    """Detect if album appears to be a compilation/soundtrack."""
+    an = norm(album_name)
+    aa = norm(album_artist)
+    # "Original Motion Picture Soundtrack", "Motion Picture Soundtrack", "OST", "Soundtrack"
+    ost = ("soundtrack" in an) or (an.endswith(" ost")) or ("motion picture" in an and "soundtrack" in an)
+    return bool(lib_flag) or is_va(album_artist) or ost
+
+
+_SMALL_RELEASE_PAT = re.compile(r"\b(single|maxi\s*single|ep)\b", re.I)
+
+
+def looks_small_release(album_name: str) -> bool:
+    """Detect if album appears to be a single or EP."""
+    return bool(_SMALL_RELEASE_PAT.search(album_name or ""))
+
+
 def location_to_path(location_url):
     """Convert iTunes file:// URL to local file path."""
     if not location_url:
@@ -286,7 +329,8 @@ def build_music_index(lib_xml, cache_conn=None):
     by_title = defaultdict(list)  # norm(title) -> [rec...]
     by_artist = defaultdict(list)  # norm(artist) -> [rec...]
     base_key_index = defaultdict(list)  # norm(artist)|norm(title) -> [rec...]
-    by_album = defaultdict(list)  # norm(album) -> [rec...] with disc/track numbers
+    by_album = defaultdict(list)  # norm(simplified album) -> [rec...] with disc/track numbers
+    album_sizes = defaultdict(int)  # album_norm -> size (for tie-breaking)
     by_isrc = {}  # ISRC -> pid (exact match, from CACHE ONLY at build time)
     by_secs = defaultdict(list)  # int seconds -> [rec...]
     by_tid = {}  # track_id -> rec for writing Tracks dict
@@ -298,9 +342,14 @@ def build_music_index(lib_xml, cache_conn=None):
             continue
 
         local_count += 1
-        artist = td.get("Artist") or td.get("Album Artist") or ""
+        track_artist = td.get("Artist") or ""
+        album_artist = td.get("Album Artist") or ""
+        # Never index under "Various Artists" – if track artist missing, leave artist blank
+        artist = track_artist if track_artist else ("" if is_va(album_artist) else album_artist)
         title = td.get("Name") or ""
-        album = td.get("Album") or ""
+        album_raw = td.get("Album") or ""
+        album = simplify_album(album_raw)
+        comp_flag = bool(td.get("Compilation"))
         disc_no = td.get("Disc Number") or 1
         track_no = td.get("Track Number") or None
         location = td.get("Location")
@@ -322,13 +371,15 @@ def build_music_index(lib_xml, cache_conn=None):
             "track_id": int(tid),
             "pid": td.get("Persistent ID"),
             "secs": secs,
-            "artist": artist,
+            "artist": track_artist or artist,   # preserve real track artist if present
             "title": title,
-            "album": album,
+            "album": album_raw,
             "disc_no": disc_no,
             "track_no": track_no,
             "location": location,
             "isrc": isrc,
+            "album_artist": album_artist,
+            "compilation": comp_flag,
         }
 
         # Add to diagnostic structures
@@ -340,6 +391,7 @@ def build_music_index(lib_xml, cache_conn=None):
         # Add to album index
         if nal:
             by_album[nal].append(rec)
+            album_sizes[nal] += 1
 
         # Add to duration index
         if secs is not None:
@@ -355,6 +407,7 @@ def build_music_index(lib_xml, cache_conn=None):
         "by_title": by_title,
         "by_artist": by_artist,
         "by_album": by_album,
+        "album_sizes": dict(album_sizes),
         "by_isrc": by_isrc,
         "by_secs": by_secs,
         "base_key_index": base_key_index,
@@ -426,7 +479,8 @@ def best_match(row, index, diag, args):
     title_simpl = simplify_title(title)
     artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
     album = row.get("Album Name", "") or row.get("album_name", "")
-    album_norm = norm(album)
+    album_norm = norm(simplify_album(album))
+    album_artist_csv = row.get("Album Artist Name(s)", "") or row.get("album_artist_name(s)", "") or ""
     isrc = (row.get("ISRC") or "").strip()
     isrc_u = isrc.upper() if isrc else ""
 
@@ -452,13 +506,17 @@ def best_match(row, index, diag, args):
     disc_csv = parse_int(row.get("Disc Number"))
     track_csv = parse_int(row.get("Track Number"))
 
+    # Determine special cases: compilation vs small release (single/EP)
+    row_is_comp = looks_compilation(album, album_artist_csv, None)
+    row_is_small = looks_small_release(album)
+
     # 0) ISRC exact match via CACHE (populated in main/process)
     if isrc_u and isrc_u in diag["by_isrc"]:
         pid = diag["by_isrc"][isrc_u]
         return diag["by_pid_map"].get(pid)  # map pid -> rec
 
-    # 1) Strong album+disc/track match
-    if album_norm and diag["by_album"].get(album_norm):
+    # 1) Strong album+disc/track match (skip if compilation-like OR small release)
+    if not (row_is_comp or row_is_small) and album_norm and diag["by_album"].get(album_norm):
         candidates = diag["by_album"][album_norm]
         # Prefer exact disc/track, else fallback by closest duration
         exact = [
@@ -479,9 +537,9 @@ def best_match(row, index, diag, args):
         near = [c for c in candidates if dur_close(c["secs"], secs)]
         near_title = [c for c in near if norm(simplify_title(c["title"])) == simp_nt]
         if near_title:
-            return near_title[0]
+            return choose_best_candidate(near_title, secs, album_norm, diag, csv_album=album)
 
-    # 2) Try multiple key variants with simplified title
+    # 2) Try multiple key variants with simplified title (this is primary for compilations)
     keys_to_try = []
 
     # Primary artist keys with both original and simplified titles
@@ -513,13 +571,12 @@ def best_match(row, index, diag, args):
                 else abs((c["secs"] or 0) - (csv_secs or 0)),
             )
 
-            for c in cands:
-                if dur_close(c["secs"], csv_secs):
-                    return c
-
-            # Fallback to first candidate if no duration match
-            if cands:
-                return cands[0]
+            # Prefer duration-close, then disambiguate with scoring
+            close = [c for c in cands if dur_close(c["secs"], csv_secs)]
+            if close:
+                return choose_best_candidate(close, secs, album_norm, diag, csv_album=album)
+            # No duration-close? take best by score anyway
+            return choose_best_candidate(cands, secs, album_norm, diag, csv_album=album)
 
     # 3) Optional guarded fuzzy fallback (only when we have album hit or duration guard)
     # search in album bucket if available, else scan all keys for artist match
@@ -581,7 +638,49 @@ def best_match(row, index, diag, args):
         if rec:
             return rec
 
+    # 4) Title-only + duration (safe, last resort) — only when compilation-like OR artist missing
+    if secs is not None:
+        bucket = diag["by_title"].get(norm(title_simpl or title), [])
+        # Filter by duration tolerance
+        bucket = [c for c in bucket if dur_close(c["secs"], secs)]
+        # If artist is missing in CSV or row smells like a compilation, allow unique duration match
+        if (not primary_artist or row_is_comp or row_is_small):
+            if len(bucket) == 1:
+                return bucket[0]
+            if bucket:
+                return choose_best_candidate(bucket, secs, album_norm, diag, csv_album=album)
+
     return None
+
+
+def choose_best_candidate(cands, target_secs, csv_album_norm, diag, csv_album=""):
+    """
+    Score candidates deterministically:
+      1) smaller duration delta is better
+      2) prefer non-single/EP albums over single/EP
+      3) prefer albums with more tracks (LP > single)
+      4) prefer album string closer to CSV album (after normalization)
+    """
+    def is_small(alb_raw):
+        return looks_small_release(alb_raw)
+    
+    def score(c):
+        # 1) duration
+        dpen = 0
+        if target_secs is not None and c.get("secs") is not None:
+            dpen = abs(int(c["secs"]) - int(target_secs))
+        # 2) single/EP penalty
+        spen = 8 if is_small(c.get("album","")) else 0
+        # 3) album size (more tracks -> bonus i.e. negative penalty)
+        nal = norm(simplify_album(c.get("album","")))
+        size = diag["album_sizes"].get(nal, 1)
+        size_pen = max(0, 6 - min(size, 12))  # 0 for size>=6, up to +5 when size<=1
+        # 4) album similarity to CSV (bonus)
+        csv_n = norm(simplify_album(csv_album))
+        alb_sim_bonus = -3 if csv_n and nal == csv_n else 0
+        return (dpen, spen + size_pen + alb_sim_bonus, c.get("track_no") or 9999)
+    
+    return min(cands, key=score)
 
 
 # ----- Diagnostic Functions -----
