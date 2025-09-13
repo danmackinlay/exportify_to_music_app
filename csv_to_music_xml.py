@@ -176,11 +176,35 @@ def simplify_title(s: str) -> str:
 
 
 _ALBUM_QUAL_PATTERNS = [
-    (re.compile(r"\s*\((?:deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*?\)\s*$", re.I), ""),
-    (re.compile(r"\s*-\s*(deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*$", re.I), ""),
-    (re.compile(r"\s*\[(?:deluxe|expanded|remaster(?:ed)?(?:\s*\d{2,4})?|edition|version).*?\]\s*$", re.I), ""),
+    (
+        re.compile(
+            r"\s*\((?:deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*?\)\s*$",
+            re.I,
+        ),
+        "",
+    ),
+    (
+        re.compile(
+            r"\s*-\s*(deluxe|expanded|special|remaster(?:ed)?(?:\s*\d{2,4})?|anniversary|edition|version).*$",
+            re.I,
+        ),
+        "",
+    ),
+    (
+        re.compile(
+            r"\s*\[(?:deluxe|expanded|remaster(?:ed)?(?:\s*\d{2,4})?|edition|version).*?\]\s*$",
+            re.I,
+        ),
+        "",
+    ),
     # Singles/EP adornments
-    (re.compile(r"\s*\((?:single|maxi single|single version|ep|digital(?:\s*45)?)\)\s*$", re.I), ""),
+    (
+        re.compile(
+            r"\s*\((?:single|maxi single|single version|ep|digital(?:\s*45)?)\)\s*$",
+            re.I,
+        ),
+        "",
+    ),
     (re.compile(r"\s*-\s*(?:single|maxi single|single version|ep)\s*$", re.I), ""),
 ]
 
@@ -201,12 +225,18 @@ def is_va(name: str) -> bool:
     return norm(name) in _VA_SET
 
 
-def looks_compilation(album_name: str, album_artist: str, lib_flag: bool | None = None) -> bool:
+def looks_compilation(
+    album_name: str, album_artist: str, lib_flag: bool | None = None
+) -> bool:
     """Detect if album appears to be a compilation/soundtrack."""
     an = norm(album_name)
-    aa = norm(album_artist)
+    norm(album_artist)
     # "Original Motion Picture Soundtrack", "Motion Picture Soundtrack", "OST", "Soundtrack"
-    ost = ("soundtrack" in an) or (an.endswith(" ost")) or ("motion picture" in an and "soundtrack" in an)
+    ost = (
+        ("soundtrack" in an)
+        or (an.endswith(" ost"))
+        or ("motion picture" in an and "soundtrack" in an)
+    )
     return bool(lib_flag) or is_va(album_artist) or ost
 
 
@@ -245,18 +275,20 @@ def canon_name(name: str) -> str:
     return s
 
 
-def derive_playlist_ids(name: str, source_id: str | None = None, salt: str = "itxml:v1"):
+def derive_playlist_ids(
+    name: str, source_id: str | None = None, salt: str = "itxml:v1"
+):
     """
     Generate deterministic playlist IDs from canonical identity.
-    
+
     Returns (playlist_id_int, playlist_persistent_id_hex16)
     - source_id: if you have a Spotify playlist URI/ID, pass it; else None.
     """
     ident = source_id or canon_name(name)
     payload = (salt + "\x1f" + ident).encode("utf-8")
     h = hashlib.sha1(payload).digest()
-    pid_hex = h.hex().upper()[:16]                 # 16 hex chars
-    int_id  = int.from_bytes(h[:4], "big") & 0x7FFFFFFF
+    pid_hex = h.hex().upper()[:16]  # 16 hex chars
+    int_id = int.from_bytes(h[:4], "big") & 0x7FFFFFFF
     if int_id == 0:
         int_id = 1
     return int_id, pid_hex
@@ -329,7 +361,9 @@ def build_music_index(lib_xml, cache_conn=None):
     by_title = defaultdict(list)  # norm(title) -> [rec...]
     by_artist = defaultdict(list)  # norm(artist) -> [rec...]
     base_key_index = defaultdict(list)  # norm(artist)|norm(title) -> [rec...]
-    by_album = defaultdict(list)  # norm(simplified album) -> [rec...] with disc/track numbers
+    by_album = defaultdict(
+        list
+    )  # norm(simplified album) -> [rec...] with disc/track numbers
     album_sizes = defaultdict(int)  # album_norm -> size (for tie-breaking)
     by_isrc = {}  # ISRC -> pid (exact match, from CACHE ONLY at build time)
     by_secs = defaultdict(list)  # int seconds -> [rec...]
@@ -345,7 +379,11 @@ def build_music_index(lib_xml, cache_conn=None):
         track_artist = td.get("Artist") or ""
         album_artist = td.get("Album Artist") or ""
         # Never index under "Various Artists" – if track artist missing, leave artist blank
-        artist = track_artist if track_artist else ("" if is_va(album_artist) else album_artist)
+        artist = (
+            track_artist
+            if track_artist
+            else ("" if is_va(album_artist) else album_artist)
+        )
         title = td.get("Name") or ""
         album_raw = td.get("Album") or ""
         album = simplify_album(album_raw)
@@ -371,7 +409,7 @@ def build_music_index(lib_xml, cache_conn=None):
             "track_id": int(tid),
             "pid": td.get("Persistent ID"),
             "secs": secs,
-            "artist": track_artist or artist,   # preserve real track artist if present
+            "artist": track_artist or artist,  # preserve real track artist if present
             "title": title,
             "album": album_raw,
             "disc_no": disc_no,
@@ -426,7 +464,7 @@ def write_playlist_xml(playlist_name, track_ids, out_dir, by_tid):
     tracks_dict = {}
     for tid in track_ids:
         rec = by_tid.get(int(tid))
-        if not rec: 
+        if not rec:
             continue
         # Use the exact Location string from the library export (already file:// URL)
         track_entry = {
@@ -441,7 +479,9 @@ def write_playlist_xml(playlist_name, track_ids, out_dir, by_tid):
         if rec.get("pid"):
             track_entry["Persistent ID"] = rec["pid"]
         if rec.get("location"):
-            track_entry["Location"] = rec["location"]  # DO NOT unquote; keep as exported
+            track_entry["Location"] = rec[
+                "location"
+            ]  # DO NOT unquote; keep as exported
         tracks_dict[str(tid)] = track_entry
 
     # Generate deterministic playlist IDs
@@ -480,7 +520,9 @@ def best_match(row, index, diag, args):
     artists_field = row.get("Artist Name(s)", "") or row.get("artist_name(s)", "")
     album = row.get("Album Name", "") or row.get("album_name", "")
     album_norm = norm(simplify_album(album))
-    album_artist_csv = row.get("Album Artist Name(s)", "") or row.get("album_artist_name(s)", "") or ""
+    album_artist_csv = (
+        row.get("Album Artist Name(s)", "") or row.get("album_artist_name(s)", "") or ""
+    )
     isrc = (row.get("ISRC") or "").strip()
     isrc_u = isrc.upper() if isrc else ""
 
@@ -516,7 +558,11 @@ def best_match(row, index, diag, args):
         return diag["by_pid_map"].get(pid)  # map pid -> rec
 
     # 1) Strong album+disc/track match (skip if compilation-like OR small release)
-    if not (row_is_comp or row_is_small) and album_norm and diag["by_album"].get(album_norm):
+    if (
+        not (row_is_comp or row_is_small)
+        and album_norm
+        and diag["by_album"].get(album_norm)
+    ):
         candidates = diag["by_album"][album_norm]
         # Prefer exact disc/track, else fallback by closest duration
         exact = [
@@ -537,7 +583,9 @@ def best_match(row, index, diag, args):
         near = [c for c in candidates if dur_close(c["secs"], secs)]
         near_title = [c for c in near if norm(simplify_title(c["title"])) == simp_nt]
         if near_title:
-            return choose_best_candidate(near_title, secs, album_norm, diag, csv_album=album)
+            return choose_best_candidate(
+                near_title, secs, album_norm, diag, csv_album=album
+            )
 
     # 2) Try multiple key variants with simplified title (this is primary for compilations)
     keys_to_try = []
@@ -574,7 +622,9 @@ def best_match(row, index, diag, args):
             # Prefer duration-close, then disambiguate with scoring
             close = [c for c in cands if dur_close(c["secs"], csv_secs)]
             if close:
-                return choose_best_candidate(close, secs, album_norm, diag, csv_album=album)
+                return choose_best_candidate(
+                    close, secs, album_norm, diag, csv_album=album
+                )
             # No duration-close? take best by score anyway
             return choose_best_candidate(cands, secs, album_norm, diag, csv_album=album)
 
@@ -644,11 +694,13 @@ def best_match(row, index, diag, args):
         # Filter by duration tolerance
         bucket = [c for c in bucket if dur_close(c["secs"], secs)]
         # If artist is missing in CSV or row smells like a compilation, allow unique duration match
-        if (not primary_artist or row_is_comp or row_is_small):
+        if not primary_artist or row_is_comp or row_is_small:
             if len(bucket) == 1:
                 return bucket[0]
             if bucket:
-                return choose_best_candidate(bucket, secs, album_norm, diag, csv_album=album)
+                return choose_best_candidate(
+                    bucket, secs, album_norm, diag, csv_album=album
+                )
 
     return None
 
@@ -661,25 +713,26 @@ def choose_best_candidate(cands, target_secs, csv_album_norm, diag, csv_album=""
       3) prefer albums with more tracks (LP > single)
       4) prefer album string closer to CSV album (after normalization)
     """
+
     def is_small(alb_raw):
         return looks_small_release(alb_raw)
-    
+
     def score(c):
         # 1) duration
         dpen = 0
         if target_secs is not None and c.get("secs") is not None:
             dpen = abs(int(c["secs"]) - int(target_secs))
         # 2) single/EP penalty
-        spen = 8 if is_small(c.get("album","")) else 0
+        spen = 8 if is_small(c.get("album", "")) else 0
         # 3) album size (more tracks -> bonus i.e. negative penalty)
-        nal = norm(simplify_album(c.get("album","")))
+        nal = norm(simplify_album(c.get("album", "")))
         size = diag["album_sizes"].get(nal, 1)
         size_pen = max(0, 6 - min(size, 12))  # 0 for size>=6, up to +5 when size<=1
         # 4) album similarity to CSV (bonus)
         csv_n = norm(simplify_album(csv_album))
         alb_sim_bonus = -3 if csv_n and nal == csv_n else 0
         return (dpen, spen + size_pen + alb_sim_bonus, c.get("track_no") or 9999)
-    
+
     return min(cands, key=score)
 
 
@@ -962,10 +1015,22 @@ def lazy_isrc_confirm(candidates, target_isrc_u, diag, args):
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
             for c, pid, p, mtime, size, isrc_found, status in ex.map(probe, to_probe):
                 # main thread: persist and update in-memory
-                cache_upsert(diag["isrc_cache_conn"], pid, p, mtime or 0.0, size or 0, isrc_found, status)
+                cache_upsert(
+                    diag["isrc_cache_conn"],
+                    pid,
+                    p,
+                    mtime or 0.0,
+                    size or 0,
+                    isrc_found,
+                    status,
+                )
                 diag["isrc_cache_by_pid"][pid] = {
-                    "path": p, "mtime": mtime, "size": size,
-                    "isrc": isrc_found, "status": status, "updated": time.time(),
+                    "path": p,
+                    "mtime": mtime,
+                    "size": size,
+                    "isrc": isrc_found,
+                    "status": status,
+                    "updated": time.time(),
                 }
                 if status == 1 and isrc_found:
                     diag["by_isrc"][isrc_found.upper()] = pid
@@ -1192,12 +1257,20 @@ def main():
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=args.workers
                 ) as ex:
-                    for pid, p, mtime, size, isrc, status in ex.map(_probe, to_prefetch[:prefetch_n]):
+                    for pid, p, mtime, size, isrc, status in ex.map(
+                        _probe, to_prefetch[:prefetch_n]
+                    ):
                         # main thread: update DB and in-memory caches
-                        cache_upsert(cache_conn, pid, p, mtime or 0.0, size or 0, isrc, status)
+                        cache_upsert(
+                            cache_conn, pid, p, mtime or 0.0, size or 0, isrc, status
+                        )
                         diag["isrc_cache_by_pid"][pid] = {
-                            "path": p, "mtime": mtime, "size": size,
-                            "isrc": isrc, "status": status, "updated": time.time(),
+                            "path": p,
+                            "mtime": mtime,
+                            "size": size,
+                            "isrc": isrc,
+                            "status": status,
+                            "updated": time.time(),
                         }
                         if status == 1 and isrc:
                             diag["by_isrc"][isrc.upper()] = pid

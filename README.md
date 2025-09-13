@@ -1,6 +1,6 @@
 # Spotify to Music.app Playlist Converter
 
-Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format for import into Music.app. These playlists will then appear in djay Pro.
+Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format for import into Music.app. These playlists will then appear in e.g. djay Pro.
 
 ## Quick Start
 
@@ -13,7 +13,7 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 
 1. **Export your Music library:**
    - Open Music.app
-   - File � Library � Export Library...
+   - File > Library > Export Library...
    - Save as `MusicLibrary.xml` in the `data/` directory
 
 2. **Export Spotify playlists:**
@@ -29,7 +29,7 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 
 4. **Import to Music.app:**
    - Open Music.app
-   - File � Library � Import Playlist...
+   - File > Library > Import Playlist...
    - Select all files in `data/music_playlists_xml/` (Cmd+A)
    - Click Open
 
@@ -41,6 +41,7 @@ Convert Spotify playlists (exported as CSV via Exportify) to iTunes XML format f
 ## How it Works
 
 The script:
+
 1. Indexes your local Music library from the exported XML
 2. Reads each Spotify CSV and matches tracks by artist, title, album, and duration
 3. Creates minimal XML files containing only playlist references to existing tracks
@@ -48,7 +49,7 @@ The script:
 
 ## Advanced Usage
 
-The converter now includes advanced matching algorithms and command-line options:
+The converter includes advanced matching algorithms and command-line options:
 
 ### Basic Options
 
@@ -95,7 +96,7 @@ ISRC matching provides:
 The converter uses a layered matching approach (in priority order):
 
 1. **ISRC exact match** - Zero ambiguity when available
-2. **Album + disc/track number** - Precise matching for well-tagged libraries  
+2. **Album + disc/track number** - Precise matching for well-tagged libraries
 3. **Title simplification** - Strips "remastered", "feat.", etc. automatically
 4. **Fuzzy matching** - Token-set similarity for close matches
 5. **Adaptive duration tolerance** - 2% tolerance for longer tracks
